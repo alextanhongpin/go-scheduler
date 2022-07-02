@@ -6,16 +6,28 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/alextanhongpin/go-scheduler"
+	"github.com/alextanhongpin/go-scheduler/pkg/server"
 	"github.com/alextanhongpin/uow"
+	"github.com/go-chi/chi"
 	_ "github.com/lib/pq"
 )
+
+const port = 8080
 
 type PublishProductRequest struct {
 	ProductIDs  []int64   `json:"productIds"`
 	PublishedAt time.Time `json:"publishedAt"`
+}
+
+type JobRequest struct {
+	Name        string          `json:"name"`
+	Type        string          `json:"type"`
+	Data        json.RawMessage `json:"data"`
+	ScheduledAt time.Time       `json:"scheduledAt"`
 }
 
 func main() {
@@ -33,26 +45,46 @@ func main() {
 	unit := uow.New(db)
 	repo := scheduler.NewStore(unit)
 	sch := scheduler.NewPostgresScheduler(repo, unit)
-
-	req := PublishProductRequest{
-		ProductIDs:  []int64{1, 2, 3},
-		PublishedAt: time.Now().Add(1 * time.Minute),
-	}
-
-	b, err := json.Marshal(req)
-	if err != nil {
-		panic(err)
-	}
-
-	data := json.RawMessage(b)
-	job := scheduler.NewStagedJob("merchant_products", "publish_product", data, req.PublishedAt)
+	sch.Register("publish_product", PublishProduct)
 
 	ctx := context.Background()
-	if err := sch.Schedule(ctx, job, PublishProduct); err != nil {
+	if err := sch.Start(ctx); err != nil {
 		panic(err)
 	}
 
-	time.Sleep(2 * time.Minute)
+	router := chi.NewRouter()
+	router.Get("/jobs", func(w http.ResponseWriter, r *http.Request) {
+		entries := sch.List()
+
+		w.Header().Set("content-type", "application/json;charset=utf8;")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(entries); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+
+			return
+		}
+	})
+
+	router.Post("/jobs", func(w http.ResponseWriter, r *http.Request) {
+		var req JobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+
+			return
+		}
+
+		job := scheduler.NewStagedJob(req.Name, req.Type, req.Data, req.ScheduledAt)
+		if err := sch.Schedule(ctx, job); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+
+			return
+		}
+
+		w.Header().Set("content-type", "application/json;charset=utf8;")
+		w.WriteHeader(http.StatusCreated)
+	})
+
+	server.New(router, port)
 }
 
 func PublishProduct(ctx context.Context, job scheduler.StagedJob, dryRun bool) error {

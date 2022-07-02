@@ -46,7 +46,7 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 
 	db := s.DB(ctx)
 
-	res, err := db.ExecContext(ctx, `
+	_, err := db.ExecContext(ctx, `
 		DELETE FROM staged_jobs 
 		WHERE name = $1 
 		AND status = $2 
@@ -54,15 +54,6 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 	`, name, Pending)
 	if err != nil {
 		return fmt.Errorf("failed to delete staged job: %w", err)
-	}
-
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("no rows deleted: %w", err)
-	}
-
-	if rows == 0 {
-		return errors.New("no rows deleted")
 	}
 
 	return nil
@@ -92,7 +83,9 @@ func (s *Store) Create(ctx context.Context, job *StagedJob) error {
 				data = EXCLUDED.data,
 				type = EXCLUDED.type,
 				status = EXCLUDED.status,
-				scheduled_at = EXCLUDED.scheduled_at
+				failure_reason = NULL,
+				scheduled_at = EXCLUDED.scheduled_at,
+				run_at = NULL
 			RETURNING id
 		`,
 		job.Name,
@@ -105,6 +98,52 @@ func (s *Store) Create(ctx context.Context, job *StagedJob) error {
 	}
 
 	return nil
+}
+
+func (s *Store) FindPending(ctx context.Context) ([]StagedJob, error) {
+	db := s.DB(ctx)
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT 
+			id, 
+			name, 
+			type,
+			data, 
+			status,
+			scheduled_at,
+			run_at
+		FROM staged_jobs 
+		WHERE status = $1
+		AND run_at IS NULL
+		FOR UPDATE NOWAIT
+	`, Pending)
+	if err != nil {
+		return nil, fmt.Errorf("select query error: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []StagedJob
+	for rows.Next() {
+		var job StagedJob
+		if err := rows.Scan(
+			&job.ID,
+			&job.Name,
+			&job.Type,
+			&job.Data,
+			&job.Status,
+			&job.ScheduledAt,
+			&job.RunAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan job: %w", err)
+		}
+
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to process rows: %w", err)
+	}
+
+	return jobs, nil
 }
 
 func (s *Store) FindAndLockPendingByName(ctx context.Context, name string) (*StagedJob, error) {

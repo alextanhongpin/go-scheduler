@@ -1,6 +1,8 @@
 include .env
 export
 
+include curl/Makefile
+
 run:
 	@go run -race cmd/main.go
 
