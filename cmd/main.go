@@ -45,7 +45,7 @@ func main() {
 	unit := uow.New(db)
 	repo := scheduler.NewStore(unit)
 	sch := scheduler.NewPostgresScheduler(repo, unit)
-	sch.Register("publish_product", PublishProduct)
+	sch.AddCronFunc("publish_product", PublishProduct)
 
 	ctx := context.Background()
 	if err := sch.Start(ctx); err != nil {

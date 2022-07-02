@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
 )
 
 type StagedJob struct {
@@ -19,6 +20,8 @@ type StagedJob struct {
 	RunAt         sql.NullTime
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+
+	cronEntryID cron.EntryID
 }
 
 func NewStagedJob(name, typ string, data json.RawMessage, scheduledAt time.Time) *StagedJob {

@@ -2,8 +2,8 @@
   "name": "new_product_2022",
 	"type": "publish_product",
 	"data": {
-		"publishedAt": "2022-07-02T22:24:00.000Z",
-		"productIds": [1, 2, 3]
+		"publishedAt": "2022-07-03T01:47:00.000Z",
+		"productIds": [1, 2, 3, 4]
 	},
-	"scheduledAt": "2022-07-02T22:24:00.000Z"
+	"scheduledAt": "2022-07-03T01:49:00.000Z"
 }

@@ -16,6 +16,13 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+var (
+	ErrScheduleFuncNotFound = errors.New("scheduler: ScheduleFunc not found")
+	ErrScheduleFuncExists   = errors.New("scheduler: ScheduleFunc exists")
+	ErrScheduleFuncInvalid  = errors.New("scheduler: invalid ScheduleFunc")
+	ErrInconsistentJobData  = errors.New("scheduler: inconsistent job data")
+)
+
 type repository interface {
 	Create(ctx context.Context, job *StagedJob) error
 	Delete(ctx context.Context, name string) error
@@ -27,29 +34,48 @@ type repository interface {
 
 type ScheduleFunc func(ctx context.Context, job StagedJob, dryRun bool) error
 
+// 1. Everytime the server starts, register a new server token
+
 type PostgresScheduler struct {
-	repo  repository
-	jobs  sync.Map
-	tasks sync.Map
-	unit  uow.UOW
-	log   *log.Logger // Potentially nil logger.
+	repo      repository
+	unit      uow.UOW
+	cron      *cron.Cron
+	cronJobs  sync.Map
+	cronFuncs sync.Map
+	mu        sync.RWMutex
 }
 
 func NewPostgresScheduler(repo repository, unit uow.UOW) *PostgresScheduler {
+	crn := cron.New()
+	crn.Start()
 	return &PostgresScheduler{
 		repo: repo,
 		unit: unit,
-		log:  NewLogger("[scheduler] "),
+		cron: crn,
 	}
 }
 
-func (s *PostgresScheduler) Register(name string, fn ScheduleFunc) error {
-	_, loaded := s.tasks.LoadOrStore(name, fn)
+func (s *PostgresScheduler) AddCronFunc(jobType string, fn ScheduleFunc) error {
+	_, loaded := s.cronFuncs.LoadOrStore(jobType, fn)
 	if loaded {
-		return errors.New("task exists")
+		return fmt.Errorf("%w: %s", ErrScheduleFuncExists, jobType)
 	}
 
 	return nil
+}
+
+func (s *PostgresScheduler) LoadCronFunc(jobType string) (ScheduleFunc, error) {
+	task, loaded := s.cronFuncs.Load(jobType)
+	if !loaded {
+		return nil, fmt.Errorf("%w: %s", ErrScheduleFuncNotFound, jobType)
+	}
+
+	taskFn, ok := task.(ScheduleFunc)
+	if !ok {
+		return nil, fmt.Errorf("%w: got type %T for %q", ErrScheduleFuncInvalid, task, jobType)
+	}
+
+	return taskFn, nil
 }
 
 func (s *PostgresScheduler) Start(ctx context.Context) error {
@@ -59,77 +85,235 @@ func (s *PostgresScheduler) Start(ctx context.Context) error {
 			return err
 		}
 
-		log.Println("jobs scheduled:", len(jobs))
-
 		for _, job := range jobs {
-			_ = s.unschedule(job.Name)
-
-			taskFn, err := s.loadTask(job.Type)
-			if err != nil {
+			job := job
+			if err := s.schedule(ctx, &job); err != nil {
 				return err
 			}
-
-			crontab := Crontab(job.ScheduledAt)
-
-			_, err = cron.ParseStandard(crontab)
-			if err != nil {
-				return fmt.Errorf("failed to parse cron: %s, %w", crontab, err)
-			}
-
-			cron, err := s.schedule(ctx, crontab, &job, taskFn)
-			if err != nil {
-				return err
-			}
-
-			cron.Start()
-
-			s.jobs.Store(job.Name, cron)
 		}
 
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to schedule pending tasks: %w", err)
+		return fmt.Errorf("failed to schedule pending cronFuncs: %w", err)
+	}
+
+	return nil
+}
+
+// Unschedule deletes the entry from the db and remove the job from being run.
+func (s *PostgresScheduler) Unschedule(ctx context.Context, name string) error {
+	_ = s.unschedule(name)
+
+	return s.deleteJob(ctx, name)
+}
+
+// Schedule creates a new entry in the db and schedules a new job.
+func (s *PostgresScheduler) Schedule(ctx context.Context, job *StagedJob) error {
+	if err := s.validateJob(ctx, job); err != nil {
+		return err
+	}
+
+	return s.upsertJob(ctx, job)
+}
+
+type StagedJobInfo struct {
+	StagedJob *StagedJob `json:"job"`
+	CronID    int        `json:"cronId"`
+	Next      time.Time  `json:"next"`
+	Elapsed   string     `json:"elapsed"`
+}
+
+func (s *PostgresScheduler) List() (res []StagedJobInfo) {
+	jobByCronEntryID := make(map[cron.EntryID]*StagedJob)
+	s.cronJobs.Range(func(key, value any) bool {
+		job, ok := value.(*StagedJob)
+		if !ok {
+			return ok
+		}
+
+		jobByCronEntryID[job.cronEntryID] = job
+
+		return true
+	})
+
+	s.mu.RLock()
+	entries := s.cron.Entries()
+	s.mu.RUnlock()
+
+	for _, entry := range entries {
+		res = append(res, StagedJobInfo{
+			StagedJob: jobByCronEntryID[entry.ID],
+			CronID:    int(entry.ID),
+			Next:      entry.Next,
+			Elapsed:   entry.Next.Sub(time.Now()).String(),
+		})
+	}
+
+	return
+}
+
+func (s *PostgresScheduler) atomicSchedule(ctx context.Context, job *StagedJob, fn ScheduleFunc) error {
+	defer func() {
+		s.cron.Remove(job.cronEntryID)
+	}()
+
+	return s.unit.AtomicFnContext(ctx, func(ctx context.Context) error {
+		dbJob, err := s.repo.FindAndLockPendingByName(ctx, job.Name)
+		if err != nil {
+			return fmt.Errorf("%w: failed to find and lock pending job: %s", err, job.Name)
+		}
+
+		// Check job and dbJob to see if the changes still matches.
+		// When running in multiple instances, we do not prevent the job from being
+		// scheduled on multiple instances.
+		// However, only the last registered job on the instance will execute, due
+		// to the data being stale.
+		if diff := diffJob(*job, *dbJob); diff != "" {
+			return fmt.Errorf("%w: %s", ErrInconsistentJobData, diff)
+		}
+
+		dryRun := false
+		if err := fn(ctx, *dbJob, dryRun); err != nil {
+			job.Status = Failed
+			job.FailureReason = err.Error()
+
+			if err := s.repo.UpdateFailed(ctx, job); err != nil {
+				return fmt.Errorf("%w: failed to update job status to fail: %s", err, job.Name)
+			}
+
+			return nil
+		}
+
+		job.Status = Success
+
+		if err := s.repo.UpdateSuccess(ctx, job); err != nil {
+			return fmt.Errorf("%w: failed to update job status to success: %s", err, job.Name)
+		}
+
+		return nil
+	})
+}
+
+func (s *PostgresScheduler) loadOrStore(job *StagedJob) *StagedJob {
+	unk, loaded := s.cronJobs.LoadOrStore(job.Name, job)
+	if loaded {
+		storedJob, ok := unk.(*StagedJob)
+		if !ok {
+			panic("scheduler: invalid job type")
+		}
+
+		s.mu.Lock()
+		s.cron.Remove(storedJob.cronEntryID)
+		s.mu.Unlock()
+
+		// Copy all the other properties of job.
+		*storedJob = *job
+		log.Printf("loaded existing job: %+v\n", storedJob)
+
+		return storedJob
+	}
+
+	log.Printf("created new job: %+v\n", job)
+
+	return job
+}
+
+func (s *PostgresScheduler) schedule(ctx context.Context, job *StagedJob) error {
+	job = s.loadOrStore(job)
+	if job == nil {
+		return nil
+	}
+
+	scheduleFn, err := s.LoadCronFunc(job.Type)
+	if err != nil {
+		return err
+	}
+
+	crontab := NewCronTab(job.ScheduledAt)
+	if err := crontab.Validate(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	entryID, err := s.cron.AddFunc(crontab.String(), func() {
+		localJob := new(StagedJob)
+		*localJob = *job
+		localJob.RunAt = sql.NullTime{
+			Time:  time.Now(),
+			Valid: true,
+		}
+
+		if err := s.atomicSchedule(ctx, localJob, scheduleFn); err != nil {
+			err = fmt.Errorf("failed to execute schedule func %q: %w", job.Name, err)
+			log.Println(err)
+
+			return
+		}
+	})
+	job.cronEntryID = entryID
+	s.mu.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("failed to add cron func: %w", err)
 	}
 
 	return nil
 }
 
 func (s *PostgresScheduler) unschedule(name string) bool {
-	j, loaded := s.jobs.LoadAndDelete(name)
+	unk, loaded := s.cronJobs.LoadAndDelete(name)
 	if loaded {
-		c, ok := j.(*cron.Cron)
-		if ok {
-			_ = c.Stop()
+		job, ok := unk.(*StagedJob)
+		if !ok {
+			panic("scheduler: invalid job type")
 		}
+
+		s.cron.Remove(job.cronEntryID)
 	}
 
 	return loaded
 }
 
-func (s *PostgresScheduler) Unschedule(ctx context.Context, name string) error {
-	_ = s.unschedule(name)
-
+func (s *PostgresScheduler) deleteJob(ctx context.Context, name string) error {
 	if err := s.repo.Delete(ctx, name); err != nil {
-		// Entry has not been created, skip.
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 
-		return fmt.Errorf("failed to delete job %q: %w", name, err)
+		return fmt.Errorf("%w: failed to delete job: %s", err, name)
 	}
 
 	return nil
 }
 
-func (s *PostgresScheduler) Schedule(ctx context.Context, job *StagedJob) error {
-	crontab := Crontab(job.ScheduledAt)
-
-	_, err := cron.ParseStandard(crontab)
-	if err != nil {
-		return fmt.Errorf("failed to parse cron: %s, %w", crontab, err)
+func (s *PostgresScheduler) upsertJob(ctx context.Context, job *StagedJob) error {
+	if job == nil {
+		panic("scheduler: no job to create")
 	}
 
-	taskFn, err := s.loadTask(job.Type)
+	return s.unit.AtomicFnContext(ctx, func(txCtx context.Context) error {
+		if err := s.deleteJob(txCtx, job.Name); err != nil {
+			return err
+		}
+
+		if err := s.repo.Create(txCtx, job); err != nil {
+			return fmt.Errorf("%w: failed to create job: %+v", err, job)
+		}
+
+		if err := s.schedule(ctx, job); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func (s *PostgresScheduler) validateJob(ctx context.Context, job *StagedJob) error {
+	if err := NewCronTab(job.ScheduledAt).Validate(); err != nil {
+		return err
+	}
+
+	taskFn, err := s.LoadCronFunc(job.Type)
 	if err != nil {
 		return err
 	}
@@ -139,147 +323,36 @@ func (s *PostgresScheduler) Schedule(ctx context.Context, job *StagedJob) error 
 		return fmt.Errorf("failed during validation: %w", err)
 	}
 
-	return s.unit.AtomicFnContext(ctx, func(txCtx context.Context) error {
-		if err := s.Unschedule(txCtx, job.Name); err != nil {
-			return err
-		}
-
-		if err = s.repo.Create(txCtx, job); err != nil {
-			return fmt.Errorf("failed to create: %w", err)
-		}
-
-		cron, err := s.schedule(ctx, crontab, job, taskFn)
-		if err != nil {
-			return err
-		}
-
-		cron.Start()
-
-		s.jobs.Store(job.Name, cron)
-
-		return nil
-	})
+	return nil
 }
 
-type StagedJobInfo struct {
-	Name    string    `json:"name"`
-	CronID  int       `json:"cronId"`
-	Next    time.Time `json:"next"`
-	Elapsed string    `json:"elapsed"`
-}
+var excludeDiffFields = []string{"ID", "Data", "RunAt", "CreatedAt", "UpdatedAt"}
 
-func (s *PostgresScheduler) List() (res []StagedJobInfo) {
-	s.jobs.Range(func(key, value any) bool {
-		name, ok := key.(string)
-		if !ok {
-			return ok
-		}
-
-		c, ok := value.(*cron.Cron)
-		if !ok {
-			return ok
-		}
-
-		for _, entry := range c.Entries() {
-			res = append(res, StagedJobInfo{
-				Name:    name,
-				CronID:  int(entry.ID),
-				Next:    entry.Next,
-				Elapsed: entry.Next.Sub(time.Now()).String(),
-			})
-		}
-
-		return true
-	})
-
-	return
-}
-
-func (s *PostgresScheduler) loadTask(name string) (ScheduleFunc, error) {
-	task, loaded := s.tasks.Load(name)
-	if !loaded {
-		return nil, errors.New("task not registered")
+func diffJob(lhs, rhs StagedJob) string {
+	if diff := cmp.Diff(lhs, rhs,
+		cmpopts.IgnoreFields(StagedJob{}, excludeDiffFields...),
+		cmpopts.IgnoreUnexported(StagedJob{}),
+	); diff != "" {
+		return diff
 	}
 
-	taskFn, ok := task.(ScheduleFunc)
-	if !ok {
-		return nil, errors.New("not a valid task")
+	if diff := diffJsonRawMessage(lhs.Data, rhs.Data); diff != "" {
+		return diff
 	}
 
-	return taskFn, nil
-}
-
-func (s *PostgresScheduler) schedule(ctx context.Context, crontab string, job *StagedJob, fn ScheduleFunc) (*cron.Cron, error) {
-	crn := cron.New()
-	_, err := crn.AddFunc(crontab, func() {
-		job.RunAt = sql.NullTime{
-			Time:  time.Now(),
-			Valid: true,
-		}
-
-		if err := s.atomicSchedule(ctx, job, fn); err != nil {
-			err = fmt.Errorf("failed to execute schedule func %q: %w", job.Name, err)
-			s.log.Println(err)
-
-			return
-		}
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to add cron func: %w", err)
-	}
-
-	return crn, nil
-}
-
-func (s *PostgresScheduler) atomicSchedule(ctx context.Context, job *StagedJob, fn ScheduleFunc) error {
-	return s.unit.AtomicFnContext(ctx, func(ctx context.Context) error {
-		dbJob, err := s.repo.FindAndLockPendingByName(ctx, job.Name)
-		if err != nil {
-			return fmt.Errorf("failed to find and lock pending job %q: %w", job.Name, err)
-		}
-
-		// Check job and dbJob to see if the changes still matches.
-		if diff := cmp.Diff(job, dbJob, cmpopts.IgnoreFields(StagedJob{}, "ID", "Data", "RunAt", "CreatedAt", "UpdatedAt")); diff != "" {
-			return fmt.Errorf("%s: %w", diff, errors.New("payload has changed"))
-		}
-
-		if diff := diffJsonRawMessage(job.Data, dbJob.Data); diff != "" {
-			return fmt.Errorf("%s: %w", diff, errors.New("payload has changed"))
-		}
-
-		dryRun := false
-		if err := fn(ctx, *dbJob, dryRun); err != nil {
-			job.Status = Failed
-			job.FailureReason = err.Error()
-
-			if err := s.repo.UpdateFailed(ctx, job); err != nil {
-				return fmt.Errorf("failed to update job %q status to fail: %w", job.Name, err)
-			}
-
-			return nil
-		}
-
-		job.Status = Success
-
-		if err := s.repo.UpdateSuccess(ctx, job); err != nil {
-			return fmt.Errorf("failed to update job %q status to success: %w", job.Name, err)
-		}
-
-		return nil
-	})
+	return ""
 }
 
 func diffJsonRawMessage(a, b json.RawMessage) string {
-	var m, n map[string]any
+	var lhs, rhs map[string]any
 
-	if err := json.Unmarshal(a, &m); err != nil {
+	if err := json.Unmarshal(a, &lhs); err != nil {
 		return err.Error()
 	}
 
-	if err := json.Unmarshal(b, &n); err != nil {
+	if err := json.Unmarshal(b, &rhs); err != nil {
 		return err.Error()
 	}
 
-	return cmp.Diff(m, n)
+	return cmp.Diff(lhs, rhs)
 }

@@ -127,13 +127,3 @@ func (s *TimerScheduler) remove(name string) bool {
 
 	return task.ScheduledTimer.Stop()
 }
-
-func Crontab(t time.Time) string {
-	return fmt.Sprintf("%d %d %d %d %d",
-		t.Minute(),
-		t.Hour(),
-		t.Day(),
-		t.Month(),
-		t.Weekday(),
-	)
-}
