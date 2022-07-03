@@ -28,3 +28,8 @@ Background: single instance
   - the job do not exist 
 
 Background: multiple instances 
+
+
+## Other considerations
+
+- what happens when the server restarts before the Cron task is completed
