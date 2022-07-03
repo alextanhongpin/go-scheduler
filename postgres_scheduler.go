@@ -35,8 +35,6 @@ type repository interface {
 
 type ScheduleFunc func(ctx context.Context, job StagedJob, dryRun bool) error
 
-// 1. Everytime the server starts, register a new server token
-
 type PostgresScheduler struct {
 	mu        sync.Mutex
 	cron      *cron.Cron
@@ -174,9 +172,6 @@ func (s *PostgresScheduler) schedule(ctx context.Context, job *StagedJob) error 
 	}
 
 	crontab := NewCronTab(job.ScheduledAt)
-	if err := crontab.Validate(); err != nil {
-		return err
-	}
 
 	s.mu.Lock()
 	entryID, err := s.cron.AddFunc(crontab.String(), func() {
@@ -308,10 +303,6 @@ func (s *PostgresScheduler) upsertJob(ctx context.Context, job *StagedJob) error
 }
 
 func (s *PostgresScheduler) validateJob(ctx context.Context, job *StagedJob) error {
-	if err := NewCronTab(job.ScheduledAt).Validate(); err != nil {
-		return err
-	}
-
 	taskFn, err := s.LoadCronFunc(job.Type)
 	if err != nil {
 		return err
