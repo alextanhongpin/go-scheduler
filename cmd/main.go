@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/alextanhongpin/go-scheduler"
@@ -15,8 +17,6 @@ import (
 	"github.com/go-chi/chi"
 	_ "github.com/lib/pq"
 )
-
-const port = 8080
 
 type PublishProductRequest struct {
 	ProductIDs  []int64   `json:"productIds"`
@@ -73,6 +73,8 @@ func main() {
 			return
 		}
 
+		// Override for testing.
+		req.ScheduledAt = time.Now().Add(1 * time.Minute).Round(time.Second)
 		job := scheduler.NewStagedJob(req.Name, req.Type, req.Data, req.ScheduledAt)
 		if err := sch.Schedule(ctx, job); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -83,6 +85,16 @@ func main() {
 		w.Header().Set("content-type", "application/json;charset=utf8;")
 		w.WriteHeader(http.StatusCreated)
 	})
+
+	portEnv := os.Getenv("PORT")
+	if portEnv == "" {
+		portEnv = "8080"
+	}
+
+	port, err := strconv.Atoi(portEnv)
+	if err != nil {
+		panic(err)
+	}
 
 	server.New(router, port)
 }

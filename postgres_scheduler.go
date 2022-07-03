@@ -42,11 +42,11 @@ type PostgresScheduler struct {
 	cron      *cron.Cron
 	cronJobs  sync.Map
 	cronFuncs sync.Map
-	mu        sync.RWMutex
+	mu        sync.Mutex
 }
 
 func NewPostgresScheduler(repo repository, unit uow.UOW) *PostgresScheduler {
-	crn := cron.New()
+	crn := cron.New(cron.WithLocation(time.Local))
 	crn.Start()
 	return &PostgresScheduler{
 		repo: repo,
@@ -136,11 +136,7 @@ func (s *PostgresScheduler) List() (res []StagedJobInfo) {
 		return true
 	})
 
-	s.mu.RLock()
-	entries := s.cron.Entries()
-	s.mu.RUnlock()
-
-	for _, entry := range entries {
+	for _, entry := range s.cron.Entries() {
 		res = append(res, StagedJobInfo{
 			StagedJob: jobByCronEntryID[entry.ID],
 			CronID:    int(entry.ID),
@@ -202,9 +198,7 @@ func (s *PostgresScheduler) loadOrStore(job *StagedJob) *StagedJob {
 			panic("scheduler: invalid job type")
 		}
 
-		s.mu.Lock()
 		s.cron.Remove(storedJob.cronEntryID)
-		s.mu.Unlock()
 
 		// Copy all the other properties of job.
 		*storedJob = *job

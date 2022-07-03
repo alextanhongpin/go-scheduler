@@ -12,7 +12,8 @@ type CronTab struct {
 }
 
 func NewCronTab(t time.Time) CronTab {
-	return CronTab{t.Round(time.Second)}
+	// Need to set to local time, especially for date received from db.
+	return CronTab{t.In(time.Local).Round(time.Second)}
 }
 
 func (c CronTab) String() string {
