@@ -37,6 +37,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer db.Close()
 
 	if err := db.Ping(); err != nil {
 		panic(err)
@@ -45,9 +46,13 @@ func main() {
 	unit := uow.New(db)
 	repo := scheduler.NewStore(unit)
 	sch := scheduler.NewPostgresScheduler(repo, unit)
+
+	// Register the cron jobs.
 	sch.AddCronFunc("publish_product", PublishProduct)
 
 	ctx := context.Background()
+
+	// Schedule existing pending jobs.
 	if err := sch.Start(ctx); err != nil {
 		panic(err)
 	}
@@ -86,17 +91,7 @@ func main() {
 		w.WriteHeader(http.StatusCreated)
 	})
 
-	portEnv := os.Getenv("PORT")
-	if portEnv == "" {
-		portEnv = "8080"
-	}
-
-	port, err := strconv.Atoi(portEnv)
-	if err != nil {
-		panic(err)
-	}
-
-	server.New(router, port)
+	server.New(router, getPort())
 }
 
 func PublishProduct(ctx context.Context, job scheduler.StagedJob, dryRun bool) error {
@@ -108,15 +103,27 @@ func PublishProduct(ctx context.Context, job scheduler.StagedJob, dryRun bool) e
 		return err
 	}
 
-	fmt.Printf("got req: %+v\n", req)
-
 	if dryRun {
-		fmt.Println("dry run only")
+		fmt.Println("dry-run:", job.Name)
 
 		return nil
 	}
 
-	fmt.Println("published products")
+	fmt.Println("published products:", job.Name)
 
 	return nil
+}
+
+func getPort() int {
+	portEnv := os.Getenv("PORT")
+	if portEnv == "" {
+		return 8080
+	}
+
+	port, err := strconv.Atoi(portEnv)
+	if err != nil {
+		panic(err)
+	}
+
+	return port
 }
