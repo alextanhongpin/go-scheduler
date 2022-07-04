@@ -44,16 +44,16 @@ func main() {
 	}
 
 	unit := uow.New(db)
-	repo := scheduler.NewStore(unit)
-	sch := scheduler.NewPostgresScheduler(repo, unit)
+	repo := scheduler.NewCronRepository(unit)
+	sch := scheduler.NewCronScheduler(unit, repo)
 
 	// Register the cron jobs.
-	sch.AddCronFunc("publish_product", PublishProduct)
+	sch.AddFunc("publish_product", PublishProduct)
 
 	ctx := context.Background()
 
 	// Schedule existing pending jobs.
-	if err := sch.Start(ctx); err != nil {
+	if err := sch.Init(ctx); err != nil {
 		panic(err)
 	}
 
@@ -80,7 +80,7 @@ func main() {
 
 		// Override for testing.
 		req.ScheduledAt = time.Now().Add(1 * time.Minute).Round(time.Second)
-		job := scheduler.NewStagedJob(req.Name, req.Type, req.Data, req.ScheduledAt)
+		job := scheduler.NewCronJob(req.Name, req.Type, req.Data, req.ScheduledAt)
 		if err := sch.Schedule(ctx, job); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -91,10 +91,11 @@ func main() {
 		w.WriteHeader(http.StatusCreated)
 	})
 
+	fmt.Println("starting server")
 	server.New(router, getPort())
 }
 
-func PublishProduct(ctx context.Context, job scheduler.StagedJob, dryRun bool) error {
+func PublishProduct(ctx context.Context, job *scheduler.CronJob, dryRun bool) error {
 	dec := json.NewDecoder(bytes.NewReader(job.Data))
 	dec.DisallowUnknownFields()
 

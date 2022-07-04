@@ -2,35 +2,30 @@ package scheduler
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
-	"log"
-	"os"
 
 	"github.com/alextanhongpin/uow"
+	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
-var ErrNotUpdated = errors.New("scheduler: not updated")
+var ErrNotUpdated = errors.New("store: not updated")
 
-func NewLogger(prefix string) *log.Logger {
-	logger := log.New(os.Stderr, prefix, log.LstdFlags|log.Lmsgprefix)
+var _ cronRepository = (*CronRepository)(nil)
 
-	return logger
-}
-
-var _ repository = (*Store)(nil)
-
-type Store struct {
+type CronRepository struct {
 	uow uow.IDB
 }
 
-func NewStore(uow uow.IDB) *Store {
-	return &Store{
+func NewCronRepository(uow uow.IDB) *CronRepository {
+	return &CronRepository{
 		uow: uow,
 	}
 }
 
-func (s *Store) DB(ctx context.Context) uow.IDB {
+func (s *CronRepository) DB(ctx context.Context) uow.IDB {
 	db, ok := uow.UowContext.Value(ctx)
 	if ok {
 
@@ -40,23 +35,21 @@ func (s *Store) DB(ctx context.Context) uow.IDB {
 	return s.uow
 }
 
-func (s *Store) Delete(ctx context.Context, name string) error {
+func (s *CronRepository) Delete(ctx context.Context, name string) error {
 	db := s.DB(ctx)
 
 	_, err := db.ExecContext(ctx, `
 		DELETE FROM staged_jobs 
 		WHERE name = $1 
-		AND status = $2 
-		AND run_at IS NULL
-	`, name, Pending)
+	`, name)
 	if err != nil {
-		return fmt.Errorf("%w: failed to delete staged job", err)
+		return fmt.Errorf("%w: failed to delete cron job", err)
 	}
 
 	return nil
 }
 
-func (s *Store) Create(ctx context.Context, job *StagedJob) error {
+func (s *CronRepository) Create(ctx context.Context, job *CronJob) error {
 	db := s.DB(ctx)
 
 	if err := db.QueryRowContext(ctx, `
@@ -65,22 +58,24 @@ func (s *Store) Create(ctx context.Context, job *StagedJob) error {
 				type, 
 				data, 
 				status, 
-				scheduled_at
+				scheduled_at,
+				worker_id
 			) VALUES (
 				$1,
 				$2,
 				$3,
 				$4,
-				$5
+				$5,
+				$6
 			) 
 			ON CONFLICT (name)
 			DO UPDATE SET
-				data = EXCLUDED.data,
 				type = EXCLUDED.type,
+				data = EXCLUDED.data,
 				status = EXCLUDED.status,
 				failure_reason = NULL,
 				scheduled_at = EXCLUDED.scheduled_at,
-				run_at = NULL
+				worker_id = EXCLUDED.worker_id
 			RETURNING id
 		`,
 		job.Name,
@@ -88,14 +83,15 @@ func (s *Store) Create(ctx context.Context, job *StagedJob) error {
 		job.Data,
 		job.Status,
 		job.ScheduledAt,
+		job.WorkerID,
 	).Scan(&job.ID); err != nil {
-		return fmt.Errorf("%w: failed to insert staged job", err)
+		return fmt.Errorf("%w: failed to insert cron job", err)
 	}
 
 	return nil
 }
 
-func (s *Store) FindPending(ctx context.Context) ([]StagedJob, error) {
+func (s *CronRepository) FindPending(ctx context.Context) ([]CronJob, error) {
 	db := s.DB(ctx)
 
 	rows, err := db.QueryContext(ctx, `
@@ -106,10 +102,9 @@ func (s *Store) FindPending(ctx context.Context) ([]StagedJob, error) {
 			data, 
 			status,
 			scheduled_at,
-			run_at
+			worker_id
 		FROM staged_jobs 
 		WHERE status = $1
-		AND run_at IS NULL
 		FOR UPDATE NOWAIT
 	`, Pending)
 	if err != nil {
@@ -117,9 +112,9 @@ func (s *Store) FindPending(ctx context.Context) ([]StagedJob, error) {
 	}
 	defer rows.Close()
 
-	var jobs []StagedJob
+	var jobs []CronJob
 	for rows.Next() {
-		var job StagedJob
+		var job CronJob
 		if err := rows.Scan(
 			&job.ID,
 			&job.Name,
@@ -127,7 +122,7 @@ func (s *Store) FindPending(ctx context.Context) ([]StagedJob, error) {
 			&job.Data,
 			&job.Status,
 			&job.ScheduledAt,
-			&job.RunAt,
+			&job.WorkerID,
 		); err != nil {
 			return nil, fmt.Errorf("%w: failed to scan job", err)
 		}
@@ -141,10 +136,10 @@ func (s *Store) FindPending(ctx context.Context) ([]StagedJob, error) {
 	return jobs, nil
 }
 
-func (s *Store) FindAndLockByName(ctx context.Context, name string) (*StagedJob, error) {
+func (s *CronRepository) FindByName(ctx context.Context, name string) (*CronJob, error) {
 	db := s.DB(ctx)
 
-	var job StagedJob
+	var job CronJob
 	if err := db.QueryRowContext(ctx, `
 			SELECT 
 				id, 
@@ -153,7 +148,7 @@ func (s *Store) FindAndLockByName(ctx context.Context, name string) (*StagedJob,
 				data, 
 				status,
 				scheduled_at,
-				run_at
+				worker_id
 			FROM staged_jobs 
 			WHERE name = $1
 			FOR UPDATE NOWAIT
@@ -167,30 +162,33 @@ func (s *Store) FindAndLockByName(ctx context.Context, name string) (*StagedJob,
 			&job.Data,
 			&job.Status,
 			&job.ScheduledAt,
-			&job.RunAt,
+			&job.WorkerID,
 		); err != nil {
-		return nil, fmt.Errorf("%w: failed to find pending staged jobs", err)
+		return nil, fmt.Errorf("%w: failed to cron job by name", err)
 	}
 
 	return &job, nil
 }
 
-func (s *Store) UpdateSuccess(ctx context.Context, job *StagedJob) error {
+func (s *CronRepository) UpdateStatus(ctx context.Context, name string, status Status, failureReason string) error {
 	db := s.DB(ctx)
 
 	res, err := db.ExecContext(ctx, `
 			UPDATE staged_jobs
 			SET 
 				status = $1,
-				run_at = now(),
-				failure_reason = NULL
-			WHERE name = $2
+				failure_reason = $2
+			WHERE name = $3
 		`,
-		job.Status,
-		job.Name,
+		status,
+		sql.NullString{
+			String: failureReason,
+			Valid:  len(failureReason) > 0,
+		},
+		name,
 	)
 	if err != nil {
-		return fmt.Errorf("%w: failed to update to success", err)
+		return fmt.Errorf("%w: failed to update cron job status", err)
 	}
 
 	rows, err := res.RowsAffected()
@@ -199,39 +197,49 @@ func (s *Store) UpdateSuccess(ctx context.Context, job *StagedJob) error {
 	}
 
 	if rows != 1 {
-		return fmt.Errorf("%w: jobName=%s", ErrNotUpdated, job.Name)
+		return fmt.Errorf("%w: name=%s", ErrNotUpdated, name)
 	}
 
 	return nil
 }
 
-func (s *Store) UpdateFailed(ctx context.Context, job *StagedJob) error {
+func (s *CronRepository) BulkUpdateStatus(ctx context.Context, names []string, status Status, failureReason string) error {
 	db := s.DB(ctx)
 
-	res, err := db.ExecContext(ctx, `
+	_, err := db.ExecContext(ctx, `
 			UPDATE staged_jobs
 			SET 
 				status = $1,
-				failure_reason = $2,
-				run_at = now()
-				failure_reason = NULL
-			WHERE name = $3
+				failure_reason = $2
+			WHERE name IN ($3)
 		`,
-		job.Status,
-		job.FailureReason,
-		job.Name,
+		status,
+		sql.NullString{
+			String: failureReason,
+			Valid:  len(failureReason) > 0,
+		},
+		pq.StringArray(names),
 	)
 	if err != nil {
-		return fmt.Errorf("%w: failed to update to failed", err)
+		return fmt.Errorf("%w: failed to bulk update cron job status", err)
 	}
 
-	rows, err := res.RowsAffected()
+	return nil
+}
+
+func (s *CronRepository) BulkUpdateWorkerID(ctx context.Context, workerID uuid.UUID, names []string) error {
+	db := s.DB(ctx)
+
+	_, err := db.ExecContext(ctx, `
+			UPDATE staged_jobs
+			SET worker_id = $1
+			WHERE name IN ($2)
+		`,
+		workerID,
+		pq.StringArray(names),
+	)
 	if err != nil {
-		return fmt.Errorf("%w: failed to get updated rows affected count", err)
-	}
-
-	if rows != 1 {
-		return fmt.Errorf("%w: jobName=%s", ErrNotUpdated, job.Name)
+		return fmt.Errorf("%w: failed to update worker id", err)
 	}
 
 	return nil
