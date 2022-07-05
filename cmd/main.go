@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -44,13 +45,18 @@ func main() {
 	}
 
 	unit := uow.New(db)
+
+	ctx := context.Background()
+
 	repo := scheduler.NewCronRepository(unit)
+	if err := repo.Migrate(ctx); err != nil {
+		log.Fatalf("migration failed: %v", err)
+	}
+
 	sch := scheduler.NewCronScheduler(unit, repo)
 
 	// Register the cron jobs.
 	sch.AddFunc("publish_product", PublishProduct)
-
-	ctx := context.Background()
 
 	// Schedule existing pending jobs.
 	if err := sch.Init(ctx); err != nil {
@@ -89,6 +95,17 @@ func main() {
 
 		w.Header().Set("content-type", "application/json;charset=utf8;")
 		w.WriteHeader(http.StatusCreated)
+	})
+
+	router.Delete("/jobs/{name}", func(w http.ResponseWriter, r *http.Request) {
+		name := chi.URLParam(r, "name")
+
+		if err := sch.Unschedule(ctx, name); err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	fmt.Println("starting server")

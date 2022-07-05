@@ -8,18 +8,24 @@ import (
 
 	"github.com/alextanhongpin/uow"
 	"github.com/google/uuid"
+
+	_ "embed"
+
 	"github.com/lib/pq"
 )
+
+//go:embed migration.sql
+var migration string
 
 var ErrNotUpdated = errors.New("store: not updated")
 
 var _ cronRepository = (*CronRepository)(nil)
 
 type CronRepository struct {
-	uow uow.IDB
+	uow uow.UOW
 }
 
-func NewCronRepository(uow uow.IDB) *CronRepository {
+func NewCronRepository(uow uow.UOW) *CronRepository {
 	return &CronRepository{
 		uow: uow,
 	}
@@ -32,14 +38,22 @@ func (s *CronRepository) DB(ctx context.Context) uow.IDB {
 		return db
 	}
 
-	return s.uow
+	return s.uow.(*uow.UnitOfWork)
+}
+
+func (s *CronRepository) Migrate(ctx context.Context) error {
+	return s.uow.AtomicFn(ctx, func(uow *uow.UnitOfWork) error {
+		_, err := uow.ExecContext(ctx, migration)
+
+		return err
+	}, nil)
 }
 
 func (s *CronRepository) Delete(ctx context.Context, name string) error {
 	db := s.DB(ctx)
 
 	_, err := db.ExecContext(ctx, `
-		DELETE FROM staged_jobs 
+		DELETE FROM cron_jobs 
 		WHERE name = $1 
 	`, name)
 	if err != nil {
@@ -53,7 +67,7 @@ func (s *CronRepository) Create(ctx context.Context, job *CronJob) error {
 	db := s.DB(ctx)
 
 	if err := db.QueryRowContext(ctx, `
-			INSERT INTO staged_jobs(
+			INSERT INTO cron_jobs(
 				name, 
 				type, 
 				data, 
@@ -91,7 +105,83 @@ func (s *CronRepository) Create(ctx context.Context, job *CronJob) error {
 	return nil
 }
 
-func (s *CronRepository) FindPending(ctx context.Context) ([]CronJob, error) {
+// FindAndLockForWorkerByName locks the given row by name for a worker. If
+// there are multiple attempts to lock the row, only the first succeeds.
+func (s *CronRepository) FindAndLockForWorkerByName(ctx context.Context, workerID uuid.UUID, name string) (*CronJob, error) {
+	db := s.DB(ctx)
+
+	var job CronJob
+	if err := db.QueryRowContext(ctx, `
+			SELECT 
+				id, 
+				name, 
+				type,
+				data, 
+				status,
+				scheduled_at,
+				worker_id
+			FROM cron_jobs 
+			WHERE name = $1
+			AND worker_id = $2
+			FOR UPDATE NOWAIT
+		`,
+		name,
+		workerID,
+	).
+		Scan(
+			&job.ID,
+			&job.Name,
+			&job.Type,
+			&job.Data,
+			&job.Status,
+			&job.ScheduledAt,
+			&job.WorkerID,
+		); err != nil {
+		return nil, fmt.Errorf("%w: failed to cron job by name", err)
+	}
+
+	return &job, nil
+}
+
+// FindAndLockByName locks the given row that matches the condition. If there
+// are more than one attempt to lock the row, only the first succeeds.
+func (s *CronRepository) FindAndLockByName(ctx context.Context, name string) (*CronJob, error) {
+	db := s.DB(ctx)
+
+	var job CronJob
+	if err := db.QueryRowContext(ctx, `
+			SELECT 
+				id, 
+				name, 
+				type,
+				data, 
+				status,
+				scheduled_at,
+				worker_id
+			FROM cron_jobs 
+			WHERE name = $1
+			FOR UPDATE NOWAIT
+		`,
+		name,
+	).
+		Scan(
+			&job.ID,
+			&job.Name,
+			&job.Type,
+			&job.Data,
+			&job.Status,
+			&job.ScheduledAt,
+			&job.WorkerID,
+		); err != nil {
+		return nil, fmt.Errorf("%w: failed to cron job by name", err)
+	}
+
+	return &job, nil
+}
+
+// FindAndLockPending attempts to find all pending jobs. If there are multiple
+// attempts to lock the rows, only the first succeeds.
+func (s *CronRepository) FindAndLockPending(ctx context.Context) ([]CronJob, error) {
 	db := s.DB(ctx)
 
 	rows, err := db.QueryContext(ctx, `
@@ -103,7 +193,7 @@ func (s *CronRepository) FindPending(ctx context.Context) ([]CronJob, error) {
 			status,
 			scheduled_at,
 			worker_id
-		FROM staged_jobs 
+		FROM cron_jobs 
 		WHERE status = $1
 		FOR UPDATE NOWAIT
 	`, Pending)
@@ -136,45 +226,11 @@ func (s *CronRepository) FindPending(ctx context.Context) ([]CronJob, error) {
 	return jobs, nil
 }
 
-func (s *CronRepository) FindByName(ctx context.Context, name string) (*CronJob, error) {
-	db := s.DB(ctx)
-
-	var job CronJob
-	if err := db.QueryRowContext(ctx, `
-			SELECT 
-				id, 
-				name, 
-				type,
-				data, 
-				status,
-				scheduled_at,
-				worker_id
-			FROM staged_jobs 
-			WHERE name = $1
-			FOR UPDATE NOWAIT
-		`,
-		name,
-	).
-		Scan(
-			&job.ID,
-			&job.Name,
-			&job.Type,
-			&job.Data,
-			&job.Status,
-			&job.ScheduledAt,
-			&job.WorkerID,
-		); err != nil {
-		return nil, fmt.Errorf("%w: failed to cron job by name", err)
-	}
-
-	return &job, nil
-}
-
 func (s *CronRepository) UpdateStatus(ctx context.Context, name string, status Status, failureReason string) error {
 	db := s.DB(ctx)
 
 	res, err := db.ExecContext(ctx, `
-			UPDATE staged_jobs
+			UPDATE cron_jobs
 			SET 
 				status = $1,
 				failure_reason = $2
@@ -207,11 +263,11 @@ func (s *CronRepository) BulkUpdateStatus(ctx context.Context, names []string, s
 	db := s.DB(ctx)
 
 	_, err := db.ExecContext(ctx, `
-			UPDATE staged_jobs
+			UPDATE cron_jobs
 			SET 
 				status = $1,
 				failure_reason = $2
-			WHERE name IN ($3)
+			WHERE name = ANY($3)
 		`,
 		status,
 		sql.NullString{
@@ -231,9 +287,9 @@ func (s *CronRepository) BulkUpdateWorkerID(ctx context.Context, workerID uuid.U
 	db := s.DB(ctx)
 
 	_, err := db.ExecContext(ctx, `
-			UPDATE staged_jobs
+			UPDATE cron_jobs
 			SET worker_id = $1
-			WHERE name IN ($2)
+			WHERE name = ANY($2)
 		`,
 		workerID,
 		pq.StringArray(names),

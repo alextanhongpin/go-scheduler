@@ -24,18 +24,18 @@ var (
 )
 
 type CronJob struct {
-	ID            uuid.UUID
-	WorkerID      uuid.UUID
-	Name          string
-	Type          string
-	Status        Status
-	Data          json.RawMessage
-	FailureReason string
-	ScheduledAt   time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID            uuid.UUID       `json:"id"`
+	WorkerID      uuid.UUID       `json:"workerId"`
+	Name          string          `json:"name"`
+	Type          string          `json:"type"`
+	Status        Status          `json:"status"`
+	Data          json.RawMessage `json:"data"`
+	FailureReason string          `json:"failureReason"`
+	ScheduledAt   time.Time       `json:"scheduledAt"`
+	CreatedAt     time.Time       `json:"createdAt"`
+	UpdatedAt     time.Time       `json:"updatedAt"`
 
-	CronEntryID cron.EntryID
+	CronEntryID cron.EntryID `json:"cronEntryId"`
 }
 
 func NewCronJob(name, typ string, data json.RawMessage, scheduledAt time.Time) *CronJob {
@@ -63,8 +63,9 @@ type cronRepository interface {
 	UpdateStatus(ctx context.Context, name string, status Status, failureReason string) error
 	BulkUpdateStatus(ctx context.Context, names []string, status Status, failureReason string) error
 	BulkUpdateWorkerID(ctx context.Context, workerID uuid.UUID, names []string) error
-	FindByName(ctx context.Context, name string) (*CronJob, error)
-	FindPending(ctx context.Context) ([]CronJob, error)
+	FindAndLockByName(ctx context.Context, name string) (*CronJob, error)
+	FindAndLockForWorkerByName(ctx context.Context, workerID uuid.UUID, name string) (*CronJob, error)
+	FindAndLockPending(ctx context.Context) ([]CronJob, error)
 }
 
 type CronScheduler struct {
@@ -82,9 +83,12 @@ func NewCronScheduler(unit uow.UOW, repo cronRepository) *CronScheduler {
 	crn := cron.New()
 	crn.Start()
 
+	id := uuid.New()
+	log.Printf("running cron: worker_id=%s\n", id)
+
 	return &CronScheduler{
 		cron:  crn,
-		id:    uuid.New(),
+		id:    id,
 		funcs: NewAtomicMac[string, CronFunc](),
 		crons: NewAtomicMac[string, *CronJob](),
 		unit:  unit,
@@ -102,7 +106,7 @@ func (s *CronScheduler) AddFunc(name string, fn CronFunc) error {
 
 func (s *CronScheduler) Init(ctx context.Context) error {
 	return s.unit.AtomicFnContext(ctx, func(ctx context.Context) error {
-		jobs, err := s.repo.FindPending(ctx)
+		jobs, err := s.repo.FindAndLockPending(ctx)
 		if err != nil {
 			return err
 		}
@@ -140,7 +144,7 @@ func (s *CronScheduler) Schedule(ctx context.Context, job *CronJob) error {
 	job.WorkerID = s.id
 
 	return s.unit.AtomicFnContext(ctx, func(txCtx context.Context) error {
-		cronJob, err := s.repo.FindByName(txCtx, job.Name)
+		cronJob, err := s.repo.FindAndLockByName(txCtx, job.Name)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
@@ -191,17 +195,13 @@ func (s *CronScheduler) schedule(ctx context.Context, job *CronJob) error {
 		}(job)
 
 		if err := s.unit.AtomicFnContext(ctx, func(ctx context.Context) error {
-			cronJob, err := s.repo.FindByName(ctx, job.Name)
+			cronJob, err := s.repo.FindAndLockForWorkerByName(ctx, s.id, job.Name)
 			if err != nil {
-				return fmt.Errorf("%w: failed to find cron by name: %s", err, job.Name)
+				return fmt.Errorf("%w: failed to find cron: name=%s worker_id=%s", err, job.Name, s.id)
 			}
 
 			if cronJob.Status.IsSuccess() {
 				return fmt.Errorf("%w: %s", ErrCronCompleted, job.Name)
-			}
-
-			if cronJob.WorkerID != s.id {
-				return fmt.Errorf("%w: Cron(name=%s) assigned to Worker(id=%s), currently running Worker(id=%s)", ErrCronReassigned, job.Name, cronJob.WorkerID, s.id)
 			}
 
 			dryRun := false
