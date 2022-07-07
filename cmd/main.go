@@ -65,11 +65,16 @@ func main() {
 
 	router := chi.NewRouter()
 	router.Get("/jobs", func(w http.ResponseWriter, r *http.Request) {
-		entries := sch.List()
+		jobs, err := sch.List(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+
+			return
+		}
 
 		w.Header().Set("content-type", "application/json;charset=utf8;")
 		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(entries); err != nil {
+		if err := json.NewEncoder(w).Encode(jobs); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 
 			return

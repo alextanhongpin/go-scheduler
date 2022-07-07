@@ -226,6 +226,52 @@ func (s *CronRepository) FindAndLockPending(ctx context.Context) ([]CronJob, err
 	return jobs, nil
 }
 
+// FindPendingByWorkerID find pending jobs by worker id.
+func (s *CronRepository) FindPendingByWorkerID(ctx context.Context, workerID uuid.UUID) ([]CronJob, error) {
+	db := s.DB(ctx)
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT 
+			id, 
+			name, 
+			type,
+			data, 
+			status,
+			scheduled_at,
+			worker_id
+		FROM cron_jobs 
+		WHERE status = $1
+		AND worker_id = $2
+	`, Pending, workerID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: select query error", err)
+	}
+	defer rows.Close()
+
+	var jobs []CronJob
+	for rows.Next() {
+		var job CronJob
+		if err := rows.Scan(
+			&job.ID,
+			&job.Name,
+			&job.Type,
+			&job.Data,
+			&job.Status,
+			&job.ScheduledAt,
+			&job.WorkerID,
+		); err != nil {
+			return nil, fmt.Errorf("%w: failed to scan job", err)
+		}
+
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: failed to process rows", err)
+	}
+
+	return jobs, nil
+}
+
 func (s *CronRepository) UpdateStatus(ctx context.Context, name string, status Status, failureReason string) error {
 	db := s.DB(ctx)
 

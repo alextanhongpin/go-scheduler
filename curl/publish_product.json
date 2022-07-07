@@ -3,7 +3,7 @@
 	"type": "publish_product",
 	"data": {
 		"publishedAt": "2022-07-03T01:47:00.000Z",
-		"productIds": [1, 2, 3, 5]
+		"productIds": [1, 2, 3, 4]
 	},
 	"scheduledAt": "2022-07-03T13:25:00.000Z"
 }

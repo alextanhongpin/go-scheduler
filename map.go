@@ -7,7 +7,7 @@ type AtomicMap[U comparable, V any] struct {
 	value map[U]V
 }
 
-func NewAtomicMac[U comparable, V any]() *AtomicMap[U, V] {
+func NewAtomicMap[U comparable, V any]() *AtomicMap[U, V] {
 	return &AtomicMap[U, V]{
 		value: make(map[U]V),
 	}
@@ -22,6 +22,12 @@ func (a *AtomicMap[U, V]) Range(fn func(key U, val V) bool) {
 		}
 	}
 	a.mu.RUnlock()
+}
+
+func (a *AtomicMap[U, V]) Set(key U, value V) {
+	a.mu.Lock()
+	a.value[key] = value
+	a.mu.Unlock()
 }
 
 func (a *AtomicMap[U, V]) Add(key U, value V) bool {

@@ -34,8 +34,6 @@ type CronJob struct {
 	ScheduledAt   time.Time       `json:"scheduledAt"`
 	CreatedAt     time.Time       `json:"createdAt"`
 	UpdatedAt     time.Time       `json:"updatedAt"`
-
-	CronEntryID cron.EntryID `json:"cronEntryId"`
 }
 
 func NewCronJob(name, typ string, data json.RawMessage, scheduledAt time.Time) *CronJob {
@@ -66,6 +64,7 @@ type cronRepository interface {
 	FindAndLockByName(ctx context.Context, name string) (*CronJob, error)
 	FindAndLockForWorkerByName(ctx context.Context, workerID uuid.UUID, name string) (*CronJob, error)
 	FindAndLockPending(ctx context.Context) ([]CronJob, error)
+	FindPendingByWorkerID(ctx context.Context, workerID uuid.UUID) ([]CronJob, error)
 }
 
 type CronScheduler struct {
@@ -74,7 +73,7 @@ type CronScheduler struct {
 
 	id    uuid.UUID
 	funcs *AtomicMap[string, CronFunc]
-	crons *AtomicMap[string, *CronJob]
+	crons *AtomicMap[string, cron.EntryID]
 	unit  uow.UOW
 	repo  cronRepository
 }
@@ -89,8 +88,8 @@ func NewCronScheduler(unit uow.UOW, repo cronRepository) *CronScheduler {
 	return &CronScheduler{
 		cron:  crn,
 		id:    id,
-		funcs: NewAtomicMac[string, CronFunc](),
-		crons: NewAtomicMac[string, *CronJob](),
+		funcs: NewAtomicMap[string, CronFunc](),
+		crons: NewAtomicMap[string, cron.EntryID](),
 		unit:  unit,
 		repo:  repo,
 	}
@@ -124,20 +123,31 @@ func (s *CronScheduler) Init(ctx context.Context) error {
 	})
 }
 
-func (s *CronScheduler) List() (res []CronInfo) {
-	s.crons.Range(func(name string, job *CronJob) bool {
-		entry := s.cron.Entry(job.CronEntryID)
+func (s *CronScheduler) List(ctx context.Context) ([]CronInfo, error) {
+	jobs, err := s.repo.FindPendingByWorkerID(ctx, s.id)
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]CronInfo, 0, len(jobs))
+
+	for _, job := range jobs {
+		cronEntryID, found := s.crons.Get(job.Name)
+		if !found {
+			continue
+		}
+
+		entry := s.cron.Entry(cronEntryID)
+
 		res = append(res, CronInfo{
-			Job:    job,
+			Job:    &job,
 			Next:   entry.Next,
 			Left:   entry.Next.Sub(time.Now()).String(),
 			CronID: entry.ID,
 		})
+	}
 
-		return true
-	})
-
-	return
+	return res, nil
 }
 
 func (s *CronScheduler) Schedule(ctx context.Context, job *CronJob) error {
@@ -170,7 +180,6 @@ func (s *CronScheduler) Unschedule(ctx context.Context, name string) error {
 	}
 
 	s.unschedule(name)
-	s.crons.Remove(name)
 
 	return nil
 }
@@ -186,13 +195,8 @@ func (s *CronScheduler) schedule(ctx context.Context, job *CronJob) error {
 		return fmt.Errorf("%w: failed to exec dry-run", err)
 	}
 
-	s.unschedule(job.Name)
-
 	entryID, err := s.cron.AddFunc(CronSpec(job.ScheduledAt), func() {
-		defer func(job *CronJob) {
-			s.cron.Remove(job.CronEntryID)
-			s.crons.Remove(job.Name)
-		}(job)
+		defer s.crons.Remove(job.Name)
 
 		if err := s.unit.AtomicFnContext(ctx, func(ctx context.Context) error {
 			cronJob, err := s.repo.FindAndLockForWorkerByName(ctx, s.id, job.Name)
@@ -226,25 +230,20 @@ func (s *CronScheduler) schedule(ctx context.Context, job *CronJob) error {
 		return fmt.Errorf("%w: failed to schedule cron job", err)
 	}
 
-	s.mu.Lock()
-	job.CronEntryID = entryID
-	s.mu.Unlock()
-
-	s.crons.Remove(job.Name)
-	if !s.crons.Add(job.Name, job) {
-		panic("job not added")
-	}
+	s.unschedule(job.Name)
+	s.crons.Set(job.Name, entryID)
 
 	return nil
 }
 
 func (s *CronScheduler) unschedule(name string) {
-	cron, found := s.crons.Get(name)
+	cronEntryID, found := s.crons.Get(name)
 	if !found {
 		return
 	}
 
-	s.cron.Remove(cron.CronEntryID)
+	s.cron.Remove(cronEntryID)
+	s.crons.Remove(name)
 }
 
 func CronSpec(t time.Time) string {
