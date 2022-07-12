@@ -3,7 +3,7 @@ module github.com/alextanhongpin/go-scheduler
 go 1.18
 
 require (
-	github.com/alextanhongpin/uow v0.0.0-20220702082040-11b5e4f7fe29
+	github.com/alextanhongpin/uow v0.0.0-20220712154745-34aed0333942
 	github.com/go-chi/chi v1.5.4
 	github.com/google/go-cmp v0.5.8
 	github.com/google/uuid v1.3.0

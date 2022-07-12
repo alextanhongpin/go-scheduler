@@ -2,6 +2,8 @@ github.com/alextanhongpin/uow v0.0.0-20220702064230-2660bb84188e h1:/79w6pucWQpP
 github.com/alextanhongpin/uow v0.0.0-20220702064230-2660bb84188e/go.mod h1:YQ+zwE8ETfXwVciqw/6ssO6kYSLAVrsE5X3RHmzVClM=
 github.com/alextanhongpin/uow v0.0.0-20220702082040-11b5e4f7fe29 h1:+dLllb/1olpld3dK/V1IHbngbC97mtXw+mzYPw12ce0=
 github.com/alextanhongpin/uow v0.0.0-20220702082040-11b5e4f7fe29/go.mod h1:YQ+zwE8ETfXwVciqw/6ssO6kYSLAVrsE5X3RHmzVClM=
+github.com/alextanhongpin/uow v0.0.0-20220712154745-34aed0333942 h1:FDCcladlUw1gTu8xo65PwBRh9q/CW+3UH2wp6rkt9XM=
+github.com/alextanhongpin/uow v0.0.0-20220712154745-34aed0333942/go.mod h1:YQ+zwE8ETfXwVciqw/6ssO6kYSLAVrsE5X3RHmzVClM=
 github.com/coreos/go-systemd/v22 v22.3.3-0.20220203105225-a9a7ef127534/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
 github.com/go-chi/chi v1.5.4 h1:QHdzF2szwjqVV4wmByUnTcsbIg7UGaQ0tPF2t5GcAIs=
 github.com/go-chi/chi v1.5.4/go.mod h1:uaf8YgoFazUOkPBG7fxPftUylNumIev9awIWOENIuEg=

@@ -137,7 +137,7 @@ func (s *CronScheduler) List(ctx context.Context) ([]CronInfo, error) {
 }
 
 func (s *CronScheduler) Schedule(ctx context.Context, job *CronJob) error {
-	return s.unit.AtomicFnContext(ctx, func(txCtx context.Context) error {
+	return s.unit.RunInTxContext(ctx, func(txCtx context.Context) error {
 		cronJob, err := s.repo.FindAndLockByName(txCtx, job.Name)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -182,7 +182,7 @@ func (s *CronScheduler) schedule(ctx context.Context, job *CronJob) error {
 	entryID, err := s.cron.AddFunc(CronSpec(job.ScheduledAt), func() {
 		defer s.crons.Remove(job.Name)
 
-		if err := s.unit.AtomicFnContext(ctx, func(ctx context.Context) error {
+		if err := s.unit.RunInTxContext(ctx, func(ctx context.Context) error {
 			cronJob, err := s.repo.FindAndLockPendingByName(ctx, job.Name)
 			if err != nil {
 				return fmt.Errorf("%w: failed to find cron: name=%s", err, job.Name)

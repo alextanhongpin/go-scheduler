@@ -28,7 +28,7 @@ func NewCronRepository(uow uow.UOW) *CronRepository {
 	}
 }
 
-func (s *CronRepository) DB(ctx context.Context) uow.IDB {
+func (s *CronRepository) DB(ctx context.Context) uow.DB {
 	db, ok := uow.UowContext.Value(ctx)
 	if ok {
 
@@ -39,7 +39,7 @@ func (s *CronRepository) DB(ctx context.Context) uow.IDB {
 }
 
 func (s *CronRepository) Migrate(ctx context.Context) error {
-	return s.uow.AtomicFn(ctx, func(uow *uow.UnitOfWork) error {
+	return s.uow.RunInTx(ctx, func(uow *uow.UnitOfWork) error {
 		_, err := uow.ExecContext(ctx, migration)
 
 		return err
