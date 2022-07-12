@@ -113,7 +113,7 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	fmt.Println("starting server")
+	fmt.Printf("listening to port *:%d. press ctrl + c to cancel\n", getPort())
 	server.New(router, getPort())
 }
 

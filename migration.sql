@@ -15,7 +15,6 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
 	data jsonb not null,
 	status cron_job_status not null default 'PENDING',
 	failure_reason text check ((status = 'FAILED') = (failure_reason IS NOT NULL)),
-	worker_id uuid not null,
 
 	scheduled_at timestamptz not null,
 
